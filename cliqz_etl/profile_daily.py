@@ -7,6 +7,7 @@ from datetime import date
 
 
 def main(sc, sqlContext):
+    # Load testpilot data
     sqlContext.read.parquet("s3://telemetry-parquet/harter/cliqz_testpilot/v1/")\
         .createOrReplaceTempView('cliqz_testpilot')
     sqlContext.read.parquet("s3://telemetry-parquet/harter/cliqz_testpilottest/v1/")\
@@ -49,8 +50,6 @@ def main(sc, sqlContext):
         .map(lambda x: (x.client_id, x))\
         .join(ms_list)\
         .flatMap(filter_and_flatten)
-
-
     
     aggregated_ms = filtered_ms.map(prep_ms_agg).reduceByKey(agg_func)
     aggregated_txp = txp.rdd.map(prep_txp_agg).reduceByKey(agg_func)
@@ -144,8 +143,8 @@ def filter_and_flatten(row):
 AggRow = namedtuple("AggRow", ['raw_row', 'agg_field'])
 
 def agg_func(x, y):
-    print x
     return x[0], x[1] + y[1]
+
 
 def prep_ms_agg(row):
     """Prepare main_summary data to be merged with textpilot data
@@ -173,6 +172,7 @@ def prep_ms_agg(row):
             })
         )
     )
+
 
 def prep_txp_agg(row):
     """Prepare testpilot data to be merged with main_summary data
