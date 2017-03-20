@@ -6,7 +6,7 @@ import uuid
 from datetime import date
 
 
-def main(sc, sqlContext):
+def main(sc, sqlContext, save=True):
     # Load testpilot data
     sqlContext.read.parquet("s3://telemetry-parquet/harter/cliqz_testpilot/v1/")\
         .createOrReplaceTempView('cliqz_testpilot')
@@ -39,9 +39,9 @@ def main(sc, sqlContext):
         """)
 
     client_ids = earliest_ping_per_client\
-        .rdd.map(lambda x: str(x.client_id)).distinct().collect()
+        .rdd.map(lambda x: str(x.client_id)).distinct().take(10)#.collect()
 
-    ms_list = get_all_ms_data(client_ids)
+    ms_list = get_all_ms_data(sc, client_ids)
 
     # Reduce the main_summary data to recent pings, where "recent" includes
     # all pings send after the start of the experiment or within two weeks
@@ -67,7 +67,7 @@ def main(sc, sqlContext):
     return final
 
 
-def filter_client_ids(client_id):
+def is_valid_client_id(client_id):
     """Tests whether a client_id meet's hbase's requirements for a UUID"""
     try:
         uuid.UUID(client_id)
@@ -96,22 +96,21 @@ def filter_ms_payload(row):
                 [("has_addon", "testpilot@cliqz.com" in addons)])
 
 
-def read_ms_data(clients):
+def read_ms_data(sc, clients):
     """Reads main_summary data from hbase and returns filtered pings"""
-    view = HBaseMainSummaryView()
-    return view.get_range(
+
+
+def get_all_ms_data(sc, client_ids):
+    """cleans a list of client_ids and draws main_summary data from hbase"""
+    clean_client_ids = filter(is_valid_client_id, client_ids)
+    
+    main_summary_data = HBaseMainSummaryView().get_range(
         sc,
-        clients,
+        clean_client_ids,
         range_start=date(2017,1,1),
         range_end=date.today(),
         limit=1000
     ).map(lambda (k, v): (k, map(filter_ms_payload, v)))
-
-
-def get_all_ms_data(client_ids):
-    """cleans a list of client_ids and draws main_summary data from hbase"""
-    clean_client_ids = clean_clients(client_ids)
-    main_summary_data = read_ms_data(clean_client_ids)
     
     return sc.parallelize(main_summary_data)
 
