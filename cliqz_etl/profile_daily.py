@@ -1,58 +1,75 @@
-
-# coding: utf-8
-
-# In[186]:
-
-sc.cancelAllJobs()
-
-
-# ## Load Test Pilot Data
-
-# In[1]:
-
-sqlContext.read.parquet("s3://telemetry-parquet/harter/cliqz_testpilot/v1/").createOrReplaceTempView('cliqz_testpilot')
-sqlContext.read.parquet("s3://telemetry-parquet/harter/cliqz_testpilottest/v1/").createOrReplaceTempView('cliqz_testpilottest')
-
-
-# In[2]:
-
-txp_min_query = """
-SELECT tp.client_id, min(date) as min_date
-FROM cliqz_testpilot tp
-JOIN cliqz_testpilottest tpt
-ON tpt.client_id = tp.client_id
-GROUP BY 1
-"""
-
-txp_min = sqlContext.sql(txp_min_query)
-
-txp_query = """
-SELECT 
-    tp.client_id,
-    tpt.cliqz_client_id,
-    tp.submission as submission_date,
-    tp.cliqz_version,
-    tp.has_addon,
-    tp.cliqz_version,
-    tpt.event,
-    tp.event as tp_event,
-    tpt.content_search_engine
-FROM cliqz_testpilot tp
-JOIN cliqz_testpilottest tpt
-ON tpt.client_id = tp.client_id
-AND tpt.submission == tp.submission
-"""
-txp = sqlContext.sql(txp_query)
-
-
-# ## Load Main Summary data with HBase
-
-# In[8]:
-
-client_ids = txp_min.rdd.map(lambda x: str(x.client_id)).distinct().collect()
-
+from moztelemetry.hbase import HBaseMainSummaryView
+from collections import Counter, namedtuple
+from pyspark.sql import Row
+from datetime import datetime, timedelta
 import uuid
+from datetime import date
+
+
+def main(sc, sqlContext):
+    sqlContext.read.parquet("s3://telemetry-parquet/harter/cliqz_testpilot/v1/")\
+        .createOrReplaceTempView('cliqz_testpilot')
+    sqlContext.read.parquet("s3://telemetry-parquet/harter/cliqz_testpilottest/v1/")\
+        .createOrReplaceTempView('cliqz_testpilottest')
+
+    earliest_ping_per_client = sqlContext.sql("""
+        SELECT tp.client_id, min(date) as min_date
+        FROM cliqz_testpilot tp
+        JOIN cliqz_testpilottest tpt
+        ON tpt.client_id = tp.client_id
+        GROUP BY 1
+        """)
+
+    txp_data = sqlContext.sql("""
+        SELECT 
+            tp.client_id,
+            tpt.cliqz_client_id,
+            tp.submission as submission_date,
+            tp.cliqz_version,
+            tp.has_addon,
+            tp.cliqz_version,
+            tpt.event,
+            tp.event as tp_event,
+            tpt.content_search_engine
+        FROM cliqz_testpilot tp
+        JOIN cliqz_testpilottest tpt
+        ON tpt.client_id = tp.client_id
+        AND tpt.submission == tp.submission
+        """)
+
+    client_ids = earliest_ping_per_client\
+        .rdd.map(lambda x: str(x.client_id)).distinct().collect()
+
+    ms_list = get_all_ms_data(client_ids)
+
+    # Reduce the main_summary data to recent pings, where "recent" includes
+    # all pings send after the start of the experiment or within two weeks
+    # of the start of the experiment.
+    filtered_ms = txp_min.rdd\
+        .map(lambda x: (x.client_id, x))\
+        .join(ms_list)\
+        .flatMap(filter_and_flatten)
+
+
+    
+    aggregated_ms = filtered_ms.map(prep_ms_agg).reduceByKey(agg_func)
+    aggregated_txp = txp.rdd.map(prep_txp_agg).reduceByKey(agg_func)
+
+    # Join aggregated tables
+    joined = agg_ms.fullOuterJoin(agg_txp)
+    flattened = joined.map(format_row)
+
+    final = sqlContext.createDataFrame(flattened)
+
+    if save:
+        final.write.mode("overwrite")\
+            .parquet("s3n://telemetry-parquet/harter/cliqz_profile_daily/v2/")
+
+    return final
+
+
 def filter_client_ids(client_id):
+    """Tests whether a client_id meet's hbase's requirements for a UUID"""
     try:
         uuid.UUID(client_id)
     except:
@@ -60,15 +77,9 @@ def filter_client_ids(client_id):
     
     return True
 
-clean_clients = filter(filter_client_ids, client_ids)
-print len(clean_clients)
-print len(set(clean_clients))
 
-
-# In[17]:
-
-from datetime import date
 def filter_ms_payload(row):
+    """Takes an hbase main_summary row and filters to interesting fields"""
     fields = [
         'submission_date',
         'normalized_channel',
@@ -82,43 +93,30 @@ def filter_ms_payload(row):
     addons = map(lambda x: x['addon_id'],
                  row.get('active_addons', []))
 
-    return dict(zip(fields, [row.get(ff) for ff in fields]) +
+    return dict([(key, row.get(key)) for key in fields] +
                 [("has_addon", "testpilot@cliqz.com" in addons)])
 
-from moztelemetry.hbase import HBaseMainSummaryView
-view = HBaseMainSummaryView()
-def read_ms_data(clients):
-    # This function has difficulty handling more than ~500 clients
-    # see https://gist.github.com/harterrt/cf0f3812d28f6d4d5cafacfba3308f19
-    return view.get_range(sc, clients,
-                       range_start=date(2017,1,1),
-                       range_end=date.today(), limit=180)\
-        .map(lambda (k, v): (k, map(filter_ms_payload, v)))
 
-def paginate(seq, slice_len):
-    # Split a list into a list of lists with length slice_len
-    for ii in xrange(0, len(seq), slice_len):
-        yield seq[ii:ii+slice_len]
+def read_ms_data(clients):
+    """Reads main_summary data from hbase and returns filtered pings"""
+    view = HBaseMainSummaryView()
+    return view.get_range(
+        sc,
+        clients,
+        range_start=date(2017,1,1),
+        range_end=date.today(),
+        limit=1000
+    ).map(lambda (k, v): (k, map(filter_ms_payload, v)))
+
 
 def get_all_ms_data(client_ids):
-    # Paginate client_ids and pull data
-    groups = paginate(client_ids, 250)
-    sharded_data = map(lambda cc: read_ms_data(cc).collect(), groups)
+    """cleans a list of client_ids and draws main_summary data from hbase"""
+    clean_client_ids = clean_clients(client_ids)
+    main_summary_data = read_ms_data(clean_client_ids)
     
-    return sc.parallelize(sharded_data).flatMap(lambda x: x)
+    return sc.parallelize(main_summary_data)
 
 
-# In[19]:
-
-ms_list = get_all_ms_data(clean_clients)
-ms_list.count()
-
-
-# ## Filter to two week window of main summary
-
-# In[20]:
-
-from datetime import datetime, timedelta
 def filter_and_flatten(row):
     """Filter ms_array to rows from no earlier than 2 weeks before expt start
     
@@ -142,22 +140,6 @@ def filter_and_flatten(row):
     return map(lambda ms_dict: dict(ms_dict.items() + [('client_id', row[0])]),
                filtered)
 
-filtered_ms = txp_min.rdd.map(lambda x: (x.client_id, x))    .join(ms_list).flatMap(filter_and_flatten)
-
-
-# In[21]:
-
-filtered_ms.map(lambda x: x['client_id']).distinct().count()
-
-
-# ## Aggregate
-# 
-# This aggregation is pretty messy. 
-# We effectively take an arbitrary value for anything not included in the Counter object.
-
-# In[205]:
-
-from collections import Counter, namedtuple
 
 AggRow = namedtuple("AggRow", ['raw_row', 'agg_field'])
 
@@ -166,6 +148,14 @@ def agg_func(x, y):
     return x[0], x[1] + y[1]
 
 def prep_ms_agg(row):
+    """Prepare main_summary data to be merged with textpilot data
+
+    The merge will be keyed by (client_id, submission_date).
+    
+    row: a row of main_summary data
+    returns: A tuple with the following form:
+        (merge_key, AggRow)
+    """
     def parse_search_counts(search_counts):
         if search_counts is not None:
             return Counter({(xx['engine'] + "-" + xx['source']): xx['count'] for xx in search_counts})
@@ -185,6 +175,14 @@ def prep_ms_agg(row):
     )
 
 def prep_txp_agg(row):
+    """Prepare testpilot data to be merged with main_summary data
+
+    The merge will be keyed by (client_id, submission_date).
+    
+    row: a row of testpilot data
+    returns: A tuple with the following form:
+        (merge_key, AggRow)
+    """
     return ((row.client_id, row.submission_date),
         AggRow(
             raw_row = row,
@@ -200,132 +198,46 @@ def prep_txp_agg(row):
     )
 
 
-# In[206]:
-
-agg_ms = filtered_ms.map(prep_ms_agg).reduceByKey(agg_func)
-
-
-# In[210]:
-
-#agg_ms.take(10)
-
-
-# In[208]:
-
-agg_txp = txp.rdd.map(prep_txp_agg).reduceByKey(agg_func)
-
-
-# In[211]:
-
-#agg_txp.take(10)
-
-
-# ## Join aggregated tables
-
-# In[212]:
-
-joined = agg_ms.fullOuterJoin(agg_txp)
-
-
-# In[269]:
-
-from pyspark.sql import Row
-profile_daily = Row('client_id', 'cliqz_client_id', 'date', 'has_cliqz',
-                    'cliqz_version', 'channel', 'os', 'is_default_browser',
-                    'session_hours', 'search_default', 'search_counts',
-                    'cliqz_enabled', 'cliqz_disabled', 'test_enabled',
-                    'test_disabled', 'test_installed', 'test_uninstalled')
-
 def option(value):
+    """A poor man's Optional data type
+    
+    Returns a function that checks whether value is none before applying a
+    user defined function.
+    """
     return lambda func: func(value) if value is not None else None
 
+
 def format_row(row):
-    print(row)
-    key = row[0]
-    value = row[1]
+    key, value = row
     
     # Unfortunately, the named tuple labels aren't preserved in spark, 
     # unpacking the merged values:
-    main_summary = option(value[0][0] if value[0] is not None else None)
-    ms_agg = option(value[0][1] if value[0] is not None else None)
-    testpilot = option(value[1][0] if value[1] is not None else None)
-    txp_agg = option(value[1][1] if value[1] is not None else None)
+    main_summary, ms_agg = value[0] if value[0] is not None else (None, None)
+    testpilot, txp_agg = value[1] if value[1] is not None else (None, None)
 
-    search_counts = ms_agg(lambda x:x['search_counts'])
+    if_ms = option(main_summary)
+    if_ms_agg = option(ms_agg)
+    if_txp = option(testpilot)
+    if_txp_agg = option(txp_agg)
+
+    search_counts = if_ms_agg(lambda x:x['search_counts'])
     
     return Row(
         client_id = key[0],
-        cliqz_client_id = testpilot(lambda x: x.cliqz_client_id),
+        cliqz_client_id = if_txp(lambda x: x.cliqz_client_id),
         date = key[1],
-        has_cliqz = ms_agg(lambda x: bool(x['has_addon'])),
-        cliqz_version = testpilot(lambda x: x.cliqz_version),
-        channel = main_summary(lambda x: x['normalized_channel']),
-        os = main_summary(lambda x: x['os']),
-        is_default_browser = ms_agg(lambda x: bool(x['is_default_browser_counter'].most_common()[0][0])),
-        session_hours = ms_agg(lambda x: x['session_hours']),
-        search_default = main_summary(lambda x: x['default_search_engine']),
+        has_cliqz = if_ms_agg(lambda x: bool(x['has_addon'])),
+        cliqz_version = if_txp(lambda x: x.cliqz_version),
+        channel = if_main_summary(lambda x: x['normalized_channel']),
+        os = if_main_summary(lambda x: x['os']),
+        is_default_browser = if_ms_agg(lambda x: bool(x['is_default_browser_counter'].most_common()[0][0])),
+        session_hours = if_ms_agg(lambda x: x['session_hours']),
+        search_default = if_main_summary(lambda x: x['default_search_engine']),
         search_counts = dict(search_counts) if search_counts is not None else {},
-        cliqz_enabled = txp_agg(lambda x: x['cliqz_enabled']),
-        cliqz_disabled = txp_agg(lambda x: x['cliqz_enabled']),
-        test_enabled = txp_agg(lambda x: x['test_enabled']),
-        test_disabled = txp_agg(lambda x: x['test_disabled']),
-        test_installed = txp_agg(lambda x: x['test_installed']),
-        test_uninstalled = txp_agg(lambda x: x['test_uninstalled'])
+        cliqz_enabled = if_txp_agg(lambda x: x['cliqz_enabled']),
+        cliqz_disabled = if_txp_agg(lambda x: x['cliqz_enabled']),
+        test_enabled = if_txp_agg(lambda x: x['test_enabled']),
+        test_disabled = if_txp_agg(lambda x: x['test_disabled']),
+        test_installed = if_txp_agg(lambda x: x['test_installed']),
+        test_uninstalled = if_txp_agg(lambda x: x['test_uninstalled'])
     )
-
-
-# In[270]:
-
-final = joined.map(format_row)
-
-
-# In[271]:
-
-#ff = final.collect()
-
-
-# In[267]:
-
-#len(ff)
-#ff[:10]
-
-
-# In[259]:
-
-# sqlContext.createDataFrame(final)
-
-
-# In[260]:
-
-#txp.filter("submission_date = 20170211").count()
-
-
-# In[261]:
-
-#agg_txp.count()
-
-
-# In[262]:
-
-#agg_ms.count()
-
-
-# In[263]:
-
-#agg_ms.map(lambda x: x[1][0]['client_id']).distinct().count()
-
-
-# In[264]:
-
-#agg_txp.count() + agg_ms.count() - final.count() 
-
-
-# In[265]:
-
-local_final = sqlContext.createDataFrame(final).repartition(1).write.mode("overwrite")    .parquet("s3n://telemetry-parquet/harter/cliqz_profile_daily/v1/")
-
-
-# In[ ]:
-
-
-
