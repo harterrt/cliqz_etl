@@ -172,7 +172,7 @@ def main(sc, sqlContext, day=None, save=True):
         sqlContext.read.options(header=True) \
             .csv("s3://net-mozaws-prod-cliqz/testpilot-cliqz-telemetry.csv").rdd,
         DataFrameConfig([
-            ("client_id_cliqz", "udid", lambda x: x.split('\|')[0], StringType()),
+            ("client_id_cliqz", "udid", lambda x: x.split('|')[0], StringType()),
             ("date", "start_time", None, StringType()),
             ("is_search", "selection_type", lambda x: x in ["query", "enter", "click"], BooleanType()),
             ("entry_point", "entry_point", None, StringType()),
