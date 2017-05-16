@@ -1,6 +1,4 @@
-import ujson as json
 from datetime import *
-import pandas as pd
 from pyspark.sql.types import *
 from pyspark.sql.functions import split
 import base64
@@ -57,7 +55,10 @@ def config_to_df(sqlContext, raw_data, data_frame_config):
         raw_value = ping[column_config.path]
         func = column_config.cleaning_func
         if func is not None:
-            return func(raw_value)
+            try:
+                return func(raw_value)
+            except:
+                return None
         else:
             return raw_value
 
@@ -65,7 +66,7 @@ def config_to_df(sqlContext, raw_data, data_frame_config):
         return [build_cell(ping, col) for col in data_frame_config.columns]
 
     return sqlContext.createDataFrame(
-        raw_data.map(ping_to_row).collect(),
+        raw_data.map(ping_to_row),
         schema = data_frame_config.toStructType())
 
 def save_df(df, name, date_partition, partitions=1):
@@ -76,21 +77,23 @@ def save_df(df, name, date_partition, partitions=1):
 
 
     # Choose cliqz_{name} over cliqz/{name} b.c. path now matches presto table name
-    path_fmt = "s3a://telemetry-parquet/harter/cliqz_{name}/v1{partition_str}"
+    path_fmt = "s3n://telemetry-parquet/harter/cliqz_{name}/v1{partition_str}"
     path = path_fmt.format(name=name, partition_str=partition_str)
     df.repartition(partitions).write.mode("overwrite").parquet(path)
 
-def __main__(sc, sqlContext, day=None, save=True):
+def main(sc, sqlContext, day=None, save=True):
+    # Set day to yesterday by default
     if day is None:
-        # Set day to yesterday
         day = (date.today() - timedelta(1)).strftime("%Y%m%d")
 
+    # Helper function for pulling testpilottest and testpilot data
     get_doctype_pings = lambda docType: Dataset.from_source("telemetry")\
         .where(docType=docType)\
         .where(submissionDate=day)\
         .where(appName="Firefox")\
         .records(sc)
 
+    # Cliqz sends an encrypted client_id, this function decrypts the key
     KEY = sc.textFile("s3://telemetry-parquet/harter/cliqz_key").take(1)[0]
     def decrypt_cliqz_id(cliqz_id, key=KEY):
         if cliqz_id is not None:
@@ -102,14 +105,15 @@ def __main__(sc, sqlContext, day=None, save=True):
         else:
             return None
 
+    # Encrypted cliqz_id includes a date-string we don't need
     def split_cliqz_id(cliqz_id):
         decrypted = decrypt_cliqz_id(cliqz_id)
-        return decrypted.split("|")[0] if decrypted is not None else None
+        return decrypted.split("|")[0]
 
-    get_cliqz_version = lambda x: x["testpilot@cliqz.com"]["version"] if x is not None and "testpilot@cliqz.com" in x.keys() else None
-    has_addon = lambda x: "testpilot@cliqz.com" in x.keys() if x is not None else None
-    get_event = lambda x: x[0]["event"] if x is not None else None
-    get_event_object = lambda x: x[0]["object"] if x is not None else None
+    get_cliqz_version = lambda x: x["testpilot@cliqz.com"]["version"]
+    has_addon = lambda x: "testpilot@cliqz.com" in x.keys()
+    get_event = lambda x: x[0]["event"]
+    get_event_object = lambda x: x[0]["object"]
 
     testpilot_df = pings_to_df(
         sqlContext,
@@ -133,8 +137,6 @@ def __main__(sc, sqlContext, day=None, save=True):
         )
     ).filter("event_object = 'testpilot@cliqz.com'")
 
-    if save:
-        save_df(testpilot_df, "testpilot", day)
 
     testpilottest_df = pings_to_df(
         sqlContext,
@@ -164,17 +166,6 @@ def __main__(sc, sqlContext, day=None, save=True):
         )
     ).filter("event IS NOT NULL")
 
-    if save:
-        save_df(testpilottest_df, "testpilottest", day, partitions=16*5)
-
-    def try_convert(conv_func, value):
-        try:
-            return conv_func(value)
-        except:
-            return None
-
-    to_bool = lambda x: try_convert(bool, x)
-    to_int = lambda x: try_convert(int, x)
 
     search_df = config_to_df(
         sqlContext,
@@ -185,18 +176,18 @@ def __main__(sc, sqlContext, day=None, save=True):
             ("date", "start_time", None, StringType()),
             ("is_search", "selection_type", lambda x: x in ["query", "enter", "click"], BooleanType()),
             ("entry_point", "entry_point", None, StringType()),
-            ("num_cliqz_results_shown", "final_result_list_backend_result_count", to_int, LongType()),
-            ("were_browser_results_shown", "final_result_list_contains_history", to_bool, BooleanType()),
-            ("final_query_length", "selection_query_length", to_int, LongType()),
+            ("num_cliqz_results_shown", "final_result_list_backend_result_count", int, LongType()),
+            ("were_browser_results_shown", "final_result_list_contains_history", bool, BooleanType()),
+            ("final_query_length", "selection_query_length", int, LongType()),
             ("landing_type", "selection_type", None, StringType()),
             ("landing_rich_type", "selection_class", None, StringType()),
-            ("landed_on_inner_link", "selection_element", to_bool, BooleanType()),
-            ("landing_position", "selection_index", to_int, LongType()),
+            ("landed_on_inner_link", "selection_element", bool, BooleanType()),
+            ("landing_position", "selection_index", int, LongType()),
             ("autocompleted", "selection_type", lambda x: x == "autocomplete", BooleanType()),
             ("navigated_to_search_page", "selection_type", lambda x: x == "query", BooleanType()),
-            ("count", "total_signal_count", to_int, LongType()),
-            ("selection_time", "selection_time", to_int, LongType()),
-            ("final_result_list_show_time", "final_result_list_show_time", to_int, LongType()),
+            ("count", "total_signal_count", int, LongType()),
+            ("selection_time", "selection_time", int, LongType()),
+            ("final_result_list_show_time", "final_result_list_show_time", int, LongType()),
             ("selection_source", "selection_source", None, StringType())
             ],
             lambda ping: True
@@ -205,5 +196,7 @@ def __main__(sc, sqlContext, day=None, save=True):
 
     if save:
         save_df(search_df, "search", None)
+        save_df(testpilottest_df, "testpilottest", day, partitions=16*5)
+        save_df(testpilot_df, "testpilot", day)
 
     return testpilot_df, testpilottest_df, search_df
