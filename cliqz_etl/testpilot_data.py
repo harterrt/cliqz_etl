@@ -99,7 +99,7 @@ def main(sc, sqlContext, day=None, save=True):
         if cliqz_id is not None:
             secret = AES.new(key)
             try:
-                return secret.decrypt(base64.b64decode(cliqz_id)).rstrip("\0")
+                return secret.decrypt(base64.b64decode(cliqz_id)).rstrip("\0")[4:-4]
             except:
                 return None
         else:
