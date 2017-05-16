@@ -1,9 +1,3 @@
-
-# coding: utf-8
-
-# In[ ]:
-
-# %load ~/cliqz_ping_pipeline/transform.py
 import ujson as json
 from datetime import *
 import pandas as pd
@@ -46,7 +40,8 @@ def pings_to_df(sqlContext, pings, data_frame_config):
         data_frame_config: a list of tuples of the form:
                  (name, path, cleaning_func, column_type)
     """
-    filtered_pings = get_pings_properties(pings, data_frame_config.get_paths())        .filter(data_frame_config.ping_filter)
+    filtered_pings = get_pings_properties(pings, data_frame_config.get_paths())\
+        .filter(data_frame_config.ping_filter)
 
     return config_to_df(sqlContext, filtered_pings, data_frame_config)
 
@@ -90,7 +85,11 @@ def __main__(sc, sqlContext, day=None, save=True):
         # Set day to yesterday
         day = (date.today() - timedelta(1)).strftime("%Y%m%d")
 
-    get_doctype_pings = lambda docType: Dataset.from_source("telemetry")         .where(docType=docType)         .where(submissionDate=day)         .where(appName="Firefox")         .records(sc)
+    get_doctype_pings = lambda docType: Dataset.from_source("telemetry")\
+        .where(docType=docType)\
+        .where(submissionDate=day)\
+        .where(appName="Firefox")\
+        .records(sc)
 
     KEY = sc.textFile("s3://telemetry-parquet/harter/cliqz_key").take(1)[0]
     def decrypt_cliqz_id(cliqz_id, key=KEY):
@@ -208,24 +207,3 @@ def __main__(sc, sqlContext, day=None, save=True):
         save_df(search_df, "search", None)
 
     return testpilot_df, testpilottest_df, search_df
-
-
-# In[ ]:
-
-tp, tpt, ss = __main__(sc, sqlContext)
-
-
-# In[ ]:
-
-tp.take(2)
-
-
-# In[ ]:
-
-tpt.take(2)
-
-
-# In[ ]:
-
-ss.take(2)
-
